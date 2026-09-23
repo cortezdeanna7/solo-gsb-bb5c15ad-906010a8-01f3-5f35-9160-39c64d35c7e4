@@ -99,6 +99,7 @@ N 的实际覆盖碎片。
 | GET | `/api/analyses/{id}/rules` | 查询规则：`status=active/partial/shadowed`、`action=permit/deny`、`ip=4/6` |
 | GET | `/api/analyses/{id}/findings` | 查询发现：`severity=conflict/warning/info`、`behavioral_only=true` |
 | GET | `/api/analyses/{id}/export.json` | 以附件形式导出完整结果 JSON |
+| GET | `/api/analyses/{id}/decision-map?cidr=...` | 已保存版本在指定 CIDR 上的**只读决策地图**（最小 CIDR 分块 + 匹配链，不创建分析） |
 | GET | `/api/analyses/{base}/diff/{target}` | 两个已保存版本的**最终生效动作语义差异**（最小 CIDR + 分类计数） |
 | GET | `/health` | 健康检查 |
 
@@ -317,10 +318,95 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 - ID 格式非法（不是 `an_` + 16 个小写十六进制字符）或两个 ID 相同 → `400`；
 - 任一版本不存在 → `404`（先做格式/同一性校验，再查存在性）。
 
+### 已保存版本的 CIDR 决策地图（decision map）
+
+`GET /api/analyses/{id}/decision-map?cidr=10.10.0.0/16` 针对**一个已保存版本**
+做只读查询：把**查询 CIDR** 用网段运算切成一组**互不重叠、无遗漏的最小 CIDR 块**，
+每块上最终决策恒定。该接口**只读取该版本的规则与生效覆盖，绝不创建新分析**，可安全
+重复调用。
+
+每个分块给出：
+
+| 字段 | 说明 |
+| --- | --- |
+| `cidr` / `address_count` | 最小 CIDR 块及其精确地址数（IPv6 也为精确大整数） |
+| `action` | 最终动作 `permit` / `deny`；无任何规则匹配为 `null`（即 `none`） |
+| `winner_rule_id` / `winner_source_tag` | 该块上最长前缀匹配的胜出规则及其来源标签；未匹配为 `null` |
+| `match_chain` | CIDR 覆盖该块的**全部规则**（含完全遮蔽的祖先、落选的同 CIDR 重复规则），**前缀由长到短**；同一 CIDR 内按 `priority`（数字小者在前）再按**原提交顺序**排列。块有匹配时首项即胜出规则（`role: "winner"`，同 CIDR 落选者 `role: "duplicate"`）；未匹配块返回空链 `[]` |
+
+分块在切分后，仅把**相邻（同前缀兄弟块）且胜出规则相同**的块用
+`ipaddress.collapse_addresses` 合并；动作恰好相同但胜出规则不同的块**不会**合并；
+未匹配块之间同理。全部结果按地址顺序稳定排序。计算纯几何、不枚举地址，IPv6 超大
+空间（乃至 `::/0` 的 2¹²⁸ 地址）也精确处理。
+
+```bash
+# 规则: permit 10.0.0.0/8 -> deny 10.10.0.0/16(并有落选重复规则)-> permit 10.10.1.0/24
+curl -s "http://localhost:8080/api/analyses/an_e38b58f57faf2325/decision-map?cidr=10.10.0.0/16"
+```
+
+响应（节选）：
+
+```json
+{
+  "analysis_id": "an_e38b58f57faf2325",
+  "ruleset_hash": "e38b58f5...",
+  "analyzer_version": "1.0.0",
+  "query_cidr": "10.10.0.0/16",
+  "ip_version": 4,
+  "total_addresses": 65536,
+  "blocks": [
+    {
+      "cidr": "10.10.0.0/24",
+      "address_count": 256,
+      "action": "deny",
+      "winner_rule_id": "r2",
+      "winner_source_tag": "dc1",
+      "match_chain": [
+        {"rule_id": "r2", "cidr": "10.10.0.0/16", "action": "deny",
+         "priority": 500, "source_tag": "dc1", "role": "winner"},
+        {"rule_id": "r5", "cidr": "10.10.0.0/16", "action": "permit",
+         "priority": 700, "source_tag": "dup", "role": "duplicate"},
+        {"rule_id": "r1", "cidr": "10.0.0.0/8", "action": "permit",
+         "priority": 100, "source_tag": "hq", "role": "winner"}
+      ]
+    },
+    {
+      "cidr": "10.10.1.0/24",
+      "address_count": 256,
+      "action": "permit",
+      "winner_rule_id": "r3",
+      "winner_source_tag": "lab",
+      "match_chain": ["... r3(/24) -> r2(/16, 含落选重复) -> r1(/8) ..."]
+    }
+    // ...其余 /16 碎片同为 r2 胜出，相邻同胜者已合并为最小 CIDR
+  ],
+  "summary": {
+    "block_count": 9,
+    "matched_blocks": 9,
+    "unmatched_blocks": 0,
+    "matched_addresses": 65536,
+    "permit_addresses": 256,
+    "deny_addresses": 65280,
+    "unmatched_addresses": 0
+  }
+}
+```
+
+查询范围超出所有规则时（如规则只有 `10.0.0.0/24` 而查 `0.0.0.0/0`），规则之外的块
+`action` 为 `null`、`match_chain` 为空链；查询范围落在某条包围型规则内、但内部没有
+更具体规则时，该包围规则即为胜出者（与其 `effective_cidrs` 语义一致）。错误码：
+
+- 查询 CIDR 非法（语法错误、主机位非零、地址族格式错误，如 `10.0.0.5/24`）→ `400`，
+  形如 `{"error": "invalid_cidr", "detail": "invalid CIDR '10.0.0.5/24' (...)"}`
+  （先校验 CIDR，再查版本）；缺少 `cidr` 参数 → `422`；
+- 版本不存在 → `404`。
+
 ### 错误处理
 
 - 非法 CIDR（语法错误、主机位非零、rule_id 重复等）→ `400`，形如
   `{"error": "invalid_ruleset", "detail": "rule #1: invalid CIDR '10.0.0.5/24' (...)"}`
+- 决策地图查询 CIDR 非法 → `400`，形如
+  `{"error": "invalid_cidr", "detail": "invalid CIDR '10.0.0.5/24' (...)"}`；缺 `cidr` 参数 → `422`
 - 预演批次非法（add 撞已有 ID、replace/remove 未命中基准、同一目标出现多次、删光所有规则、
   空批次）→ `400`，形如
   `{"error": "invalid_simulation", "detail": "...", "issues": ["...全部问题..."]}`
@@ -336,6 +422,7 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 ├── app/
 │   ├── __init__.py
 │   ├── analyzer.py     # 核心引擎：CIDR 解析、trie、覆盖与最小冲突对（纯函数，可独立使用）
+│   ├── decision_map.py # 已保存版本 CIDR 决策地图：查询范围最小 CIDR 切分 + 匹配链（纯函数，可独立使用）
 │   ├── diff.py         # 版本语义差异：生效动作分区叠加 + 相邻同类范围合并（纯函数，可独立使用）
 │   ├── simulate.py     # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
 │   ├── schemas.py      # Pydantic v2 请求/响应模型
@@ -344,6 +431,7 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 ├── tests/test_api.py       # 端到端测试（pytest + TestClient）
 ├── tests/test_diff.py      # 语义差异端点测试
 ├── tests/test_simulate.py  # 规则变更预演端点测试
+├── tests/test_decision_map.py  # CIDR 决策地图端点测试
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
 ├── docker-compose.yml  # 单命令启动 + 命名卷持久化
