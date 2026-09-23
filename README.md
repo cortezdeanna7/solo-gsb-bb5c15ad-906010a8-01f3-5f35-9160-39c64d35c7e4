@@ -98,6 +98,7 @@ N 的实际覆盖碎片。
 | GET | `/api/analyses/{id}` | 取某个版本的完整分析结果 |
 | GET | `/api/analyses/{id}/rules` | 查询规则：`status=active/partial/shadowed`、`action=permit/deny`、`ip=4/6` |
 | GET | `/api/analyses/{id}/findings` | 查询发现：`severity=conflict/warning/info`、`behavioral_only=true` |
+| GET | `/api/analyses/{id}/decision-map?cidr=...` | 只读的 **CIDR 决策地图**：把查询网段切成最小 CIDR 分块，给出最终动作/胜出规则/完整匹配链 |
 | GET | `/api/analyses/{id}/export.json` | 以附件形式导出完整结果 JSON |
 | GET | `/api/analyses/{base}/diff/{target}` | 两个已保存版本的**最终生效动作语义差异**（最小 CIDR + 分类计数） |
 | GET | `/health` | 健康检查 |
@@ -270,6 +271,93 @@ curl -s -X POST http://localhost:8080/api/analyses/an_e38b58f57faf2325/simulate 
 基准版本不存在 → `404`。预演不产生任何副作用，可安全重复调用；若补丁与基准完全等价
 （如用相同记录 replace），`diff.changes` 为空且 `ruleset_hash` 与基准一致。
 
+### 已保存版本的 CIDR 决策地图（decision map）
+
+针对**已保存版本**（不会新建分析、不写库），给定一个严格的 IPv4/IPv6 CIDR 查询
+（主机位必须为 0、必须带前缀长度），以**纯网段运算**把查询范围切成**互不重叠、
+合起来无遗漏的最小 CIDR 分块**。每个分块给出：
+
+- `address_count`：该块地址数（IPv6 大整数精确给出，不枚举地址）；
+- `action`：该块的**最终生效动作** `permit`/`deny`；没有任何规则命中时为 `null`（即 `none`）；
+- `winner_rule_id` / `winner_source_tag`：胜出规则；未命中块均为 `null`；
+- `match_chain`：**完整匹配链**——所有覆盖该块地址的规则，按**前缀由长到短**排列；
+  同一 CIDR 的多条规则按 `priority`（数字小者在前）再按**原提交顺序**排列，因此
+  **有匹配时首项即胜出规则**；同 CIDR 落选的重复规则（`role: "duplicate"`，含被完全
+  遮蔽的祖先）也保留在链中；**未命中块返回空链 `[]`**。
+
+**相邻且胜出规则相同**的分块会合并（`none` 块之间同样合并；胜出规则不同、或中间
+隔着其他块的绝不合并），结果按网络地址、前缀长度**稳定排序**。分块依据是该版本
+已保存的 winner 规则 `effective_cidrs`，与 diff 端点一致，IPv6 全空间 `::/0` 查询
+也能精确处理。
+
+```bash
+curl -s "http://localhost:8080/api/analyses/an_e38b58f57faf2325/decision-map?cidr=10.10.0.0/16"
+```
+
+响应（节选）：
+
+```json
+{
+  "analysis_id": "an_e38b58f57faf2325",
+  "ruleset_hash": "e38b58f5...",
+  "query_cidr": "10.10.0.0/16",
+  "ip_version": 4,
+  "summary": {
+    "block_count": 9,
+    "matched_blocks": 9,
+    "unmatched_blocks": 0,
+    "matched_addresses": 65536,
+    "unmatched_addresses": 0,
+    "permit_addresses": 256,
+    "deny_addresses": 65280,
+    "total_addresses": 65536
+  },
+  "blocks": [
+    {
+      "cidr": "10.10.0.0/24",
+      "ip_version": 4,
+      "address_count": 256,
+      "action": "deny",
+      "winner_rule_id": "r2",
+      "winner_source_tag": "dc1",
+      "match_chain": [
+        {"rule_id": "r2", "index": 1, "cidr": "10.10.0.0/16", "action": "deny",
+         "priority": 500, "source_tag": "dc1", "role": "winner"},
+        {"rule_id": "r1", "index": 0, "cidr": "10.0.0.0/8", "action": "permit",
+         "priority": 100, "source_tag": "hq", "role": "winner"}
+      ]
+    },
+    {
+      "cidr": "10.10.1.0/24",
+      "ip_version": 4,
+      "address_count": 256,
+      "action": "permit",
+      "winner_rule_id": "r3",
+      "winner_source_tag": "lab",
+      "match_chain": [
+        {"rule_id": "r3", "index": 2, "cidr": "10.10.1.0/24", "action": "permit",
+         "priority": 900, "source_tag": "lab", "role": "winner"},
+        {"rule_id": "r2", "...": "..."},
+        {"rule_id": "r1", "...": "..."}
+      ]
+    }
+  ]
+}
+```
+
+查询范围完全落在规则覆盖之外时，得到单个未命中块：`action: null`、
+`winner_rule_id: null`、`match_chain: []`；查询跨越规则边界（如用 `8.0.0.0/6`
+查询一条 `10.0.0.0/8` 规则）时，规则两侧的未匹配区域各自合并为最小 CIDR。
+该端点**只读取该版本**，重复调用无副作用。
+
+错误码：
+
+- CIDR 非法（语法错误、主机位非零如 `10.0.0.5/24`、缺少前缀长度如 `10.0.0.0`、
+  地址族不合法等）→ `400`，形如
+  `{"error": "invalid_cidr", "detail": "invalid CIDR '10.0.0.5/24' (...)"}`
+  （先校验查询参数，再查版本）；缺少 `cidr` 参数 → `422`；
+- 版本不存在 → `404`。
+
 ### 版本语义差异（semantic diff）
 
 给定两个**已保存**版本 ID，逐地址比较它们的**最终生效动作**：地址落在某条 winner 规则的
@@ -324,7 +412,9 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 - 预演批次非法（add 撞已有 ID、replace/remove 未命中基准、同一目标出现多次、删光所有规则、
   空批次）→ `400`，形如
   `{"error": "invalid_simulation", "detail": "...", "issues": ["...全部问题..."]}`
-- 字段类型/取值错误（未知 action、空规则列表、多余字段等）→ `422`（Pydantic 校验错误）
+- 决策地图 CIDR 查询非法（主机位非零、缺前缀长度等）→ `400`，形如
+  `{"error": "invalid_cidr", "detail": "invalid CIDR '10.0.0.5/24' (...)"}`
+- 字段类型/取值错误（未知 action、空规则列表、多余字段、缺少必填查询参数等）→ `422`（Pydantic 校验错误）
 - 版本不存在 → `404`
 
 ---
@@ -335,15 +425,17 @@ curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05ad
 .
 ├── app/
 │   ├── __init__.py
-│   ├── analyzer.py     # 核心引擎：CIDR 解析、trie、覆盖与最小冲突对（纯函数，可独立使用）
-│   ├── diff.py         # 版本语义差异：生效动作分区叠加 + 相邻同类范围合并（纯函数，可独立使用）
-│   ├── simulate.py     # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
-│   ├── schemas.py      # Pydantic v2 请求/响应模型
-│   ├── db.py           # SQLite 持久层（analyses / rules / findings 三表）
-│   └── main.py         # FastAPI 路由
-├── tests/test_api.py       # 端到端测试（pytest + TestClient）
-├── tests/test_diff.py      # 语义差异端点测试
-├── tests/test_simulate.py  # 规则变更预演端点测试
+│   ├── analyzer.py      # 核心引擎：CIDR 解析、trie、覆盖与最小冲突对（纯函数，可独立使用）
+│   ├── diff.py          # 版本语义差异：生效动作分区叠加 + 相邻同类范围合并（纯函数，可独立使用）
+│   ├── decision_map.py  # 已保存版本的 CIDR 决策地图：查询网段切分 + 匹配链（纯函数，可独立使用）
+│   ├── simulate.py      # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
+│   ├── schemas.py       # Pydantic v2 请求/响应模型
+│   ├── db.py            # SQLite 持久层（analyses / rules / findings 三表）
+│   └── main.py          # FastAPI 路由
+├── tests/test_api.py           # 端到端测试（pytest + TestClient）
+├── tests/test_diff.py          # 语义差异端点测试
+├── tests/test_decision_map.py  # CIDR 决策地图端点测试
+├── tests/test_simulate.py      # 规则变更预演端点测试
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
 ├── docker-compose.yml  # 单命令启动 + 命名卷持久化

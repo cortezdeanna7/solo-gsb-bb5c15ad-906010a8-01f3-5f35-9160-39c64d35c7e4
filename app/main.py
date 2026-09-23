@@ -8,6 +8,7 @@ GET    /api/analyses                         list saved analysis versions
 GET    /api/analyses/{id}                    fetch one version with the full result
 GET    /api/analyses/{id}/rules              query rules (filters: status/action/ip_version)
 GET    /api/analyses/{id}/findings           query findings (filters: severity/behavioral_only)
+GET    /api/analyses/{id}/decision-map       CIDR decision map of this version (query: cidr)
 GET    /api/analyses/{id}/export.json        download the result as a JSON file
 GET    /api/analyses/{id}/diff/{oid}         effective-action semantic diff of two versions
 GET    /health                               liveness probe
@@ -26,6 +27,7 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .analyzer import ANALYZER_VERSION, ValidationError, analyze_rules
 from . import db
+from .decision_map import DecisionMapError, build_decision_map, parse_query_cidr
 from .diff import ANALYSIS_ID_RE, diff_analyses
 from .schemas import AnalyzeRequest, SimulateRequest
 from .simulate import PatchError, apply_patch, rebuild_input_rules
@@ -62,6 +64,11 @@ async def _patch_error_handler(_request, exc: PatchError):
         status_code=400,
         content={"error": "invalid_simulation", "detail": str(exc), "issues": exc.issues},
     )
+
+
+@app.exception_handler(DecisionMapError)
+async def _decision_map_error_handler(_request, exc: DecisionMapError):
+    return JSONResponse(status_code=400, content={"error": "invalid_cidr", "detail": str(exc)})
 
 
 def _make_id(ruleset_hash: str) -> str:
@@ -192,6 +199,30 @@ def get_findings(
     if rows is None:
         raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
     return {"analysis_id": analysis_id, "count": len(rows), "findings": rows}
+
+
+@app.get("/api/analyses/{analysis_id}/decision-map")
+def get_decision_map(
+    analysis_id: str,
+    cidr: str = Query(..., description="Strict IPv4/IPv6 CIDR query range"),
+) -> dict[str, Any]:
+    """Decision map of a *saved* version over one CIDR query.
+
+    Read-only: the version's stored rules and their winning effective
+    coverage are partitioned into disjoint, exhaustive minimal CIDR blocks.
+    Each block reports its address count, final action (``none`` when nothing
+    matches), winning rule/source tag, and the full longest-prefix-first
+    match chain (losing duplicates included). No analysis is created.
+    """
+    # The query is validated before looking the version up, mirroring the
+    # diff endpoint's format-before-existence ordering.
+    query = parse_query_cidr(cidr)
+
+    result = db.get_analysis(analysis_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+
+    return build_decision_map(result, query)
 
 
 @app.get("/api/analyses/{analysis_id}/export.json")
